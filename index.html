@@ -5,28 +5,39 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VideoPress — Compresor</title>
 <script>
-  // Register external SW that injects COOP/COEP headers (required for SharedArrayBuffer / FFmpeg WASM)
+  // Inject COOP/COEP headers via Service Worker (needed for SharedArrayBuffer / FFmpeg WASM)
   (async () => {
     if (!('serviceWorker' in navigator)) return;
+    const swCode = `
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.cache === 'only-if-cached' && e.request.mode !== 'same-origin') return;
+  e.respondWith(
+    fetch(e.request).then(r => {
+      const h = new Headers(r.headers);
+      h.set('Cross-Origin-Embedder-Policy', 'require-corp');
+      h.set('Cross-Origin-Opener-Policy', 'same-origin');
+      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+    }).catch(() => fetch(e.request))
+  );
+});`;
     try {
-      const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
+      const blob = new Blob([swCode], { type: 'text/javascript' });
+      const swUrl = URL.createObjectURL(blob);
+      const reg = await navigator.serviceWorker.register(swUrl, { scope: './' });
       if (!navigator.serviceWorker.controller) {
-        // SW just installed — wait for it to activate then reload so headers take effect
         await new Promise(resolve => {
           const w = reg.installing || reg.waiting;
           if (w) {
-            w.addEventListener('statechange', ev => {
-              if (ev.target.state === 'activated') resolve();
-            });
-          } else {
-            resolve();
+            w.addEventListener('statechange', e => { if (e.target.state === 'activated') resolve(); });
           }
-          setTimeout(resolve, 4000); // safety fallback
+          setTimeout(resolve, 3000);
         });
         location.reload();
       }
     } catch(e) {
-      console.warn('SW registration failed:', e);
+      console.warn('SW failed (FFmpeg may still work if server already sends COOP/COEP):', e);
     }
   })();
 </script>
@@ -622,7 +633,15 @@
     transition: all 0.2s;
   }
 
-  .btn-new:hover { border-color: var(--text); color: var(--text); }
+  .result-preview {
+    width: 100%;
+    max-height: 280px;
+    border-radius: 10px;
+    background: #000;
+    display: block;
+    margin-bottom: 20px;
+    outline: none;
+  }
 
   .loading-overlay {
     display: none;
@@ -819,7 +838,7 @@
         <div class="setting-group">
           <label>Audio</label>
           <select id="audioSelect">
-            <option value="copy">Copiar original (sin recodificar)</option>
+            <option value="copy">Auto (AAC 128k para MP4)</option>
             <option value="aac_128">AAC 128k</option>
             <option value="aac_192">AAC 192k</option>
             <option value="mp3_128">MP3 128k</option>
@@ -864,6 +883,7 @@
       </svg>
       ¡Compresión completada!
     </div>
+    <video id="resultVideo" class="result-preview" controls playsinline></video>
     <div class="result-stats">
       <div class="stat-card">
         <div class="stat-label">Tamaño original</div>
@@ -928,6 +948,7 @@ async function initFFmpeg() {
     ffmpegInstance = createFFmpeg({
       log: true,
       corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+      mainName: 'main',
       progress: ({ ratio }) => {
         const pct = Math.min(99, Math.round(ratio * 100));
         document.getElementById('progressBar').style.width = pct + '%';
@@ -958,7 +979,7 @@ async function initFFmpeg() {
 // Try primary CDN, fallback to unpkg
 function loadFFmpegScript() {
   const primary = 'https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js';
-  const fallback = 'https://cdnjs.cloudflare.com/ajax/libs/ffmpeg/0.11.6/ffmpeg.min.js';
+  const fallback = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js';
 
   const s = document.createElement('script');
   s.src = primary;
@@ -1133,6 +1154,9 @@ function clearFile() {
   document.getElementById('btnCompress').disabled = true;
   document.getElementById('resultPanel').classList.remove('visible');
   document.getElementById('progressPanel').classList.remove('visible');
+  // Clear video preview to free memory
+  const rv = document.getElementById('resultVideo');
+  if (rv.src) { URL.revokeObjectURL(rv.src); rv.src = ''; }
 }
 
 // ─── Compression ──────────────────────────────────────────────────────────────
@@ -1177,7 +1201,7 @@ document.getElementById('btnCompress').addEventListener('click', async () => {
     if (codec === 'libx264' || codec === 'libx265') {
       args.push('-crf', crf.toString());
       args.push('-preset', preset);
-      if (codec === 'libx265') args.push('-tag:v', 'hvc1');
+      // Note: -tag:v hvc1 removed — causes playback issues in many browsers
     } else if (codec === 'libvpx-vp9') {
       args.push('-crf', crf.toString(), '-b:v', '0');
       const deadline = { ultrafast: 'realtime', fast: 'good', medium: 'good', slow: 'best', veryslow: 'best' }[preset] || 'good';
@@ -1185,18 +1209,35 @@ document.getElementById('btnCompress').addEventListener('click', async () => {
     }
 
     // Resolution filter
+    // :-2 ensures height is divisible by 2 (required by H.264/H.265)
+    // force_original_aspect_ratio=decrease avoids cropping/stretching
     if (resolution !== 'original') {
-      args.push('-vf', `scale=${resolution}`);
+      args.push('-vf', `scale=${resolution}:force_original_aspect_ratio=decrease`);
     }
 
-    // Audio
+    // Audio handling
+    // IMPORTANT: 'copy' can produce unplayable files if the source audio codec
+    // is incompatible with the output container (e.g. PCM/Opus in MP4).
+    // We re-encode to AAC 128k when 'copy' is selected and output is MP4.
     if (audio === 'copy') {
-      args.push('-c:a', 'copy');
+      if (ext === 'mp4') {
+        // Safe fallback: copy only if source is already AAC; otherwise transcode
+        args.push('-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental');
+      } else {
+        // For WebM, copy is safe (Opus source)
+        args.push('-c:a', 'copy');
+      }
     } else if (audio === 'mp3_128') {
       args.push('-c:a', 'libmp3lame', '-b:a', '128k');
+    } else if (audio === 'aac_128') {
+      args.push('-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental');
+    } else if (audio === 'aac_192') {
+      args.push('-c:a', 'aac', '-b:a', '192k', '-strict', 'experimental');
     } else {
-      const bitrate = audio.split('_')[1] + 'k';
-      args.push('-c:a', 'aac', '-b:a', bitrate);
+      // Generic fallback: parse bitrate from value like "aac_NNN"
+      const parts = audio.split('_');
+      const bitrate = (parts[1] || '128') + 'k';
+      args.push('-c:a', 'aac', '-b:a', bitrate, '-strict', 'experimental');
     }
 
     if (ext === 'mp4') args.push('-movflags', '+faststart');
@@ -1209,7 +1250,9 @@ document.getElementById('btnCompress').addEventListener('click', async () => {
 
     const data = ffmpegInstance.FS('readFile', outputName);
     const mime = ext === 'webm' ? 'video/webm' : 'video/mp4';
-    outputBlob = new Blob([data.buffer], { type: mime });
+    // IMPORTANT: data is a Uint8Array view into the WASM heap — use .slice() to copy
+    // only the relevant bytes, NOT .buffer which would include the entire heap memory
+    outputBlob = new Blob([data.slice()], { type: mime });
 
     const origSize  = selectedFile.size;
     const newSize   = outputBlob.size;
@@ -1224,6 +1267,11 @@ document.getElementById('btnCompress').addEventListener('click', async () => {
     const dl = document.getElementById('btnDownload');
     dl.href     = url;
     dl.download = outName;
+
+    // Show inline preview so user can verify before downloading
+    const resultVideo = document.getElementById('resultVideo');
+    resultVideo.src = url;
+    resultVideo.load();
 
     document.getElementById('progressBar').style.width = '100%';
     document.getElementById('progressPct').textContent  = '100%';
