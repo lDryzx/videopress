@@ -4,43 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VideoPress — Compresor</title>
-<script>
-  // Inject COOP/COEP headers via Service Worker (needed for SharedArrayBuffer / FFmpeg WASM)
-  (async () => {
-    if (!('serviceWorker' in navigator)) return;
-    const swCode = `
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
-self.addEventListener('fetch', e => {
-  if (e.request.cache === 'only-if-cached' && e.request.mode !== 'same-origin') return;
-  e.respondWith(
-    fetch(e.request).then(r => {
-      const h = new Headers(r.headers);
-      h.set('Cross-Origin-Embedder-Policy', 'require-corp');
-      h.set('Cross-Origin-Opener-Policy', 'same-origin');
-      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
-    }).catch(() => fetch(e.request))
-  );
-});`;
-    try {
-      const blob = new Blob([swCode], { type: 'text/javascript' });
-      const swUrl = URL.createObjectURL(blob);
-      const reg = await navigator.serviceWorker.register(swUrl, { scope: './' });
-      if (!navigator.serviceWorker.controller) {
-        await new Promise(resolve => {
-          const w = reg.installing || reg.waiting;
-          if (w) {
-            w.addEventListener('statechange', e => { if (e.target.state === 'activated') resolve(); });
-          }
-          setTimeout(resolve, 3000);
-        });
-        location.reload();
-      }
-    } catch(e) {
-      console.warn('SW failed (FFmpeg may still work if server already sends COOP/COEP):', e);
-    }
-  })();
-</script>
+
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap');
 
@@ -920,10 +884,9 @@ self.addEventListener('fetch', e => {
 <script>
 // ─── State ────────────────────────────────────────────────────────────────────
 let ffmpegLoaded = false;
-let ffmpegInstance = null;
+let ffmpegInstance = null;   // FFmpeg instance (v0.12 API)
 let selectedFile = null;
 let outputBlob = null;
-let ffmpegLib = null; // will hold { createFFmpeg, fetchFile }
 
 // ─── FFmpeg Loading ───────────────────────────────────────────────────────────
 function setStatus(state, text) {
@@ -933,35 +896,53 @@ function setStatus(state, text) {
   statusText.textContent = text;
 }
 
+// FFmpeg 0.12.x uses ESM and does NOT require SharedArrayBuffer / COOP / COEP.
+// It runs the WASM in a Web Worker via MessageChannel — works fine on GitHub Pages.
+const FFMPEG_CDN   = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js';
+const CORE_MT_URL  = 'https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/umd/ffmpeg-core.js';
+const CORE_ST_URL  = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js';
+
 async function initFFmpeg() {
   setStatus('loading', 'Cargando motor FFmpeg...');
   document.getElementById('loadingOverlay').classList.add('visible');
 
   try {
-    // The CDN exposes window.FFmpeg as the namespace
-    const lib = window.FFmpeg || window.FFmpegWASM;
-    if (!lib) throw new Error('Librería FFmpeg no encontrada en window');
+    const { FFmpeg } = window.FFmpegWASM || window.FFmpeg_JS || (() => {
+      throw new Error('Librería FFmpeg no encontrada. Recargá la página.');
+    })();
 
-    const { createFFmpeg, fetchFile } = lib;
-    ffmpegLib = { createFFmpeg, fetchFile };
+    ffmpegInstance = new FFmpeg();
 
-    ffmpegInstance = createFFmpeg({
-      log: true,
-      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
-      mainName: 'main',
-      progress: ({ ratio }) => {
-        const pct = Math.min(99, Math.round(ratio * 100));
-        document.getElementById('progressBar').style.width = pct + '%';
-        document.getElementById('progressPct').textContent = pct + '%';
-        if (pct >= 99) document.getElementById('progressLabel').textContent = 'Finalizando...';
-      }
+    // Wire up log and progress events
+    ffmpegInstance.on('log', ({ message }) => {
+      const el = document.getElementById('progressLog');
+      if (el) el.textContent = message;
     });
 
-    await ffmpegInstance.load();
-    ffmpegLoaded = true;
-    setStatus('ready', 'Motor listo · FFmpeg 0.11.6');
+    ffmpegInstance.on('progress', ({ progress }) => {
+      const pct = Math.min(99, Math.round(progress * 100));
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('progressPct').textContent = pct + '%';
+      if (pct >= 99) document.getElementById('progressLabel').textContent = 'Finalizando...';
+    });
 
-    // Enable compress button if file already selected
+    // Try multi-threaded core first, fall back to single-threaded
+    let loaded = false;
+    if (typeof SharedArrayBuffer !== 'undefined') {
+      try {
+        await ffmpegInstance.load({ coreURL: CORE_MT_URL });
+        loaded = true;
+        setStatus('ready', 'Motor listo · FFmpeg 0.12 (multi-hilo)');
+      } catch (e) {
+        console.warn('MT core failed, trying ST core:', e);
+      }
+    }
+    if (!loaded) {
+      await ffmpegInstance.load({ coreURL: CORE_ST_URL });
+      setStatus('ready', 'Motor listo · FFmpeg 0.12');
+    }
+
+    ffmpegLoaded = true;
     if (selectedFile) {
       document.getElementById('btnCompress').disabled = false;
     }
@@ -970,33 +951,30 @@ async function initFFmpeg() {
     setStatus('error', 'Error al cargar FFmpeg: ' + err.message);
     document.getElementById('progressPanel').classList.add('visible');
     document.getElementById('progressLabel').textContent = '❌ Error al cargar FFmpeg';
-    document.getElementById('progressLog').textContent = 'Intentá recargar la página o usar otro navegador (Chrome recomendado).';
+    document.getElementById('progressLog').textContent = 'Intentá recargar la página o usar Chrome/Edge.';
   } finally {
     document.getElementById('loadingOverlay').classList.remove('visible');
   }
 }
 
-// Try primary CDN, fallback to unpkg
 function loadFFmpegScript() {
-  const primary = 'https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js';
-  const fallback = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js';
-
   const s = document.createElement('script');
-  s.src = primary;
-  s.crossOrigin = 'anonymous';
+  s.src = FFMPEG_CDN;
+  // FFmpeg 0.12 UMD exposes itself as window.FFmpegWASM
   s.onload = () => {
-    console.log('FFmpeg script loaded from primary CDN');
+    console.log('FFmpeg 0.12 script loaded');
+    // UMD bundle exposes as window.FFmpegWASM
+    if (!window.FFmpegWASM) {
+      // Try alternate global names the UMD might use
+      window.FFmpegWASM = window.FFmpeg_JS || window['@ffmpeg/ffmpeg'] || null;
+    }
     initFFmpeg();
   };
   s.onerror = () => {
-    console.warn('Primary CDN failed, trying fallback...');
+    // Try jsDelivr fallback
     const s2 = document.createElement('script');
-    s2.src = fallback;
-    s2.crossOrigin = 'anonymous';
-    s2.onload = () => {
-      console.log('FFmpeg script loaded from fallback CDN');
-      initFFmpeg();
-    };
+    s2.src = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js';
+    s2.onload = () => initFFmpeg();
     s2.onerror = () => {
       setStatus('error', 'No se pudo cargar FFmpeg. Verificá tu conexión.');
       document.getElementById('loadingOverlay').classList.remove('visible');
@@ -1006,7 +984,6 @@ function loadFFmpegScript() {
   document.head.appendChild(s);
 }
 
-// Start loading immediately
 loadFFmpegScript();
 
 // ─── CRF Slider ──────────────────────────────────────────────────────────────
