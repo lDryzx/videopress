@@ -5,39 +5,28 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VideoPress — Compresor</title>
 <script>
-  // Inject COOP/COEP headers via Service Worker (needed for SharedArrayBuffer / FFmpeg WASM)
+  // Register external SW that injects COOP/COEP headers (required for SharedArrayBuffer / FFmpeg WASM)
   (async () => {
     if (!('serviceWorker' in navigator)) return;
-    const swCode = `
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
-self.addEventListener('fetch', e => {
-  if (e.request.cache === 'only-if-cached' && e.request.mode !== 'same-origin') return;
-  e.respondWith(
-    fetch(e.request).then(r => {
-      const h = new Headers(r.headers);
-      h.set('Cross-Origin-Embedder-Policy', 'require-corp');
-      h.set('Cross-Origin-Opener-Policy', 'same-origin');
-      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
-    }).catch(() => fetch(e.request))
-  );
-});`;
     try {
-      const blob = new Blob([swCode], { type: 'text/javascript' });
-      const swUrl = URL.createObjectURL(blob);
-      const reg = await navigator.serviceWorker.register(swUrl, { scope: './' });
+      const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
       if (!navigator.serviceWorker.controller) {
+        // SW just installed — wait for it to activate then reload so headers take effect
         await new Promise(resolve => {
           const w = reg.installing || reg.waiting;
           if (w) {
-            w.addEventListener('statechange', e => { if (e.target.state === 'activated') resolve(); });
+            w.addEventListener('statechange', ev => {
+              if (ev.target.state === 'activated') resolve();
+            });
+          } else {
+            resolve();
           }
-          setTimeout(resolve, 3000);
+          setTimeout(resolve, 4000); // safety fallback
         });
         location.reload();
       }
     } catch(e) {
-      console.warn('SW failed (FFmpeg may still work if server already sends COOP/COEP):', e);
+      console.warn('SW registration failed:', e);
     }
   })();
 </script>
