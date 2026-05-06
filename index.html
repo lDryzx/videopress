@@ -1,0 +1,1286 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VideoPress — Compresor</title>
+<script>
+  // Inject COOP/COEP headers via Service Worker (needed for SharedArrayBuffer / FFmpeg WASM)
+  (async () => {
+    if (!('serviceWorker' in navigator)) return;
+    const swCode = `
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.cache === 'only-if-cached' && e.request.mode !== 'same-origin') return;
+  e.respondWith(
+    fetch(e.request).then(r => {
+      const h = new Headers(r.headers);
+      h.set('Cross-Origin-Embedder-Policy', 'require-corp');
+      h.set('Cross-Origin-Opener-Policy', 'same-origin');
+      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+    }).catch(() => fetch(e.request))
+  );
+});`;
+    try {
+      const blob = new Blob([swCode], { type: 'text/javascript' });
+      const swUrl = URL.createObjectURL(blob);
+      const reg = await navigator.serviceWorker.register(swUrl, { scope: './' });
+      if (!navigator.serviceWorker.controller) {
+        await new Promise(resolve => {
+          const w = reg.installing || reg.waiting;
+          if (w) {
+            w.addEventListener('statechange', e => { if (e.target.state === 'activated') resolve(); });
+          }
+          setTimeout(resolve, 3000);
+        });
+        location.reload();
+      }
+    } catch(e) {
+      console.warn('SW failed (FFmpeg may still work if server already sends COOP/COEP):', e);
+    }
+  })();
+</script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0a0a;
+    --surface: #111111;
+    --surface2: #1a1a1a;
+    --border: #2a2a2a;
+    --accent: #e8ff47;
+    --accent2: #47ffd4;
+    --text: #f0f0f0;
+    --muted: #666;
+    --danger: #ff4747;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px 80px;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(232,255,71,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(232,255,71,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    width: 100%;
+    max-width: 760px;
+    position: relative;
+    z-index: 1;
+  }
+
+  header {
+    margin-bottom: 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .logo-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .logo-icon {
+    width: 40px;
+    height: 40px;
+    background: var(--accent);
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+  }
+
+  .logo-icon svg { width: 22px; height: 22px; }
+
+  h1 {
+    font-size: clamp(28px, 5vw, 42px);
+    font-weight: 800;
+    letter-spacing: -1px;
+    line-height: 1;
+    color: var(--text);
+  }
+
+  h1 span { color: var(--accent); }
+
+  .tagline {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--muted);
+    letter-spacing: 0.5px;
+    padding-left: 54px;
+  }
+
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 16px;
+    padding: 56px 32px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    background: var(--surface);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .drop-zone::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(232,255,71,0.06) 0%, transparent 70%);
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  .drop-zone:hover, .drop-zone.dragover {
+    border-color: var(--accent);
+    background: var(--surface2);
+  }
+
+  .drop-zone:hover::before, .drop-zone.dragover::before { opacity: 1; }
+
+  .drop-icon {
+    width: 64px;
+    height: 64px;
+    margin: 0 auto 20px;
+    background: var(--surface2);
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--border);
+    transition: all 0.25s;
+  }
+
+  .drop-zone:hover .drop-icon {
+    border-color: var(--accent);
+    background: rgba(232,255,71,0.08);
+  }
+
+  .drop-icon svg { width: 28px; height: 28px; stroke: var(--accent); }
+
+  .drop-title { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+
+  .drop-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 24px;
+  }
+
+  .btn-browse {
+    display: inline-block;
+    padding: 10px 24px;
+    background: var(--accent);
+    color: #0a0a0a;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-browse:hover {
+    background: #f5ff6e;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px rgba(232,255,71,0.25);
+  }
+
+  #fileInput { display: none; }
+
+  .file-card {
+    display: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-top: 16px;
+    gap: 16px;
+    align-items: center;
+  }
+
+  .file-card.visible { display: flex; }
+
+  .file-thumb {
+    width: 72px;
+    height: 54px;
+    border-radius: 8px;
+    background: var(--surface2);
+    overflow: hidden;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--border);
+  }
+
+  .file-thumb video { width: 100%; height: 100%; object-fit: cover; }
+
+  .file-info { flex: 1; min-width: 0; }
+
+  .file-name {
+    font-weight: 700;
+    font-size: 15px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 4px;
+  }
+
+  .file-meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .btn-clear {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    color: var(--muted);
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+
+  .btn-clear:hover { border-color: var(--danger); color: var(--danger); }
+
+  .settings {
+    display: none;
+    margin-top: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+  }
+
+  .settings.visible { display: block; }
+
+  .settings-header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .settings-body { padding: 24px; display: grid; gap: 20px; }
+
+  .setting-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  @media (max-width: 540px) { .setting-row { grid-template-columns: 1fr; } }
+
+  .setting-group label {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+
+  .setting-group select, .setting-group input[type="range"] { width: 100%; }
+
+  select {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.2s;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23666' viewBox='0 0 16 16'%3E%3Cpath d='M7.247 11.14L2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 32px;
+  }
+
+  select:focus { border-color: var(--accent); }
+
+  .crf-container { display: flex; flex-direction: column; gap: 8px; }
+  .crf-header { display: flex; justify-content: space-between; align-items: center; }
+
+  .crf-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--accent);
+  }
+
+  .quality-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: rgba(232,255,71,0.1);
+    color: var(--accent);
+    border: 1px solid rgba(232,255,71,0.2);
+  }
+
+  input[type="range"] {
+    -webkit-appearance: none;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    transition: transform 0.15s;
+    box-shadow: 0 0 0 3px rgba(232,255,71,0.15);
+  }
+
+  input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
+
+  .crf-hint {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+  }
+
+  .info-box {
+    background: rgba(71,255,212,0.05);
+    border: 1px solid rgba(71,255,212,0.15);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--accent2);
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+  }
+
+  .info-box svg { flex-shrink: 0; margin-top: 1px; }
+
+  /* Warning box */
+  .warn-box {
+    background: rgba(255,168,71,0.07);
+    border: 1px solid rgba(255,168,71,0.25);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: #ffa847;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    margin-top: 16px;
+  }
+
+  .warn-box svg { flex-shrink: 0; margin-top: 1px; }
+
+  .btn-compress {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 16px;
+    background: var(--accent);
+    color: #0a0a0a;
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 16px;
+    border: none;
+    border-radius: 12px;
+    cursor: pointer;
+    margin-top: 24px;
+    transition: all 0.25s;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .btn-compress::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, transparent 40%, rgba(255,255,255,0.15) 50%, transparent 60%);
+    transform: translateX(-100%);
+    transition: transform 0.6s;
+  }
+
+  .btn-compress:hover:not(:disabled)::after { transform: translateX(100%); }
+
+  .btn-compress:hover:not(:disabled) {
+    background: #f5ff6e;
+    transform: translateY(-2px);
+    box-shadow: 0 10px 30px rgba(232,255,71,0.3);
+  }
+
+  .btn-compress:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .progress-panel {
+    display: none;
+    margin-top: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+  }
+
+  .progress-panel.visible { display: block; }
+
+  .progress-status {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .progress-label { font-weight: 700; font-size: 15px; }
+
+  .progress-pct {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 24px;
+    font-weight: 400;
+    color: var(--accent);
+  }
+
+  .progress-bar-track {
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+
+  .progress-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 3px;
+    transition: width 0.3s ease;
+    width: 0%;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .progress-bar-fill::after {
+    content: '';
+    position: absolute;
+    top: 0; left: -100%;
+    width: 100%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent);
+    animation: shimmer 1.5s infinite;
+  }
+
+  @keyframes shimmer { to { left: 200%; } }
+
+  .progress-log {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    min-height: 20px;
+    word-break: break-all;
+  }
+
+  .result-panel {
+    display: none;
+    margin-top: 24px;
+    background: var(--surface);
+    border: 1px solid rgba(71,255,212,0.2);
+    border-radius: 16px;
+    padding: 28px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .result-panel::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+  }
+
+  .result-panel.visible { display: block; }
+
+  .result-title {
+    font-size: 16px;
+    font-weight: 800;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .result-title svg { stroke: var(--accent2); }
+
+  .result-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+
+  @media (max-width: 480px) { .result-stats { grid-template-columns: 1fr; } }
+
+  .stat-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+  }
+
+  .stat-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+
+  .stat-value { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; }
+  .stat-value.highlight { color: var(--accent); }
+  .stat-value.highlight2 { color: var(--accent2); }
+
+  .btn-download {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 14px;
+    background: transparent;
+    color: var(--accent2);
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 15px;
+    border: 2px solid var(--accent2);
+    border-radius: 12px;
+    cursor: pointer;
+    transition: all 0.25s;
+    text-decoration: none;
+  }
+
+  .btn-download:hover {
+    background: var(--accent2);
+    color: #0a0a0a;
+    box-shadow: 0 8px 24px rgba(71,255,212,0.25);
+    transform: translateY(-1px);
+  }
+
+  .btn-new {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    padding: 12px;
+    margin-top: 12px;
+    background: transparent;
+    color: var(--muted);
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-new:hover { border-color: var(--text); color: var(--text); }
+
+  .loading-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(10,10,10,0.92);
+    z-index: 100;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+  }
+
+  .loading-overlay.visible { display: flex; }
+
+  .spinner {
+    width: 48px;
+    height: 48px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .loading-text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--muted);
+    text-align: center;
+    max-width: 300px;
+    line-height: 1.6;
+  }
+
+  .loading-text span { color: var(--accent); }
+
+  footer {
+    margin-top: 48px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #333;
+    text-align: center;
+  }
+
+  /* Status indicator for FFmpeg load */
+  .ffmpeg-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+
+  .status-dot.loading { background: #ffa847; animation: pulse 1s infinite; }
+  .status-dot.ready { background: var(--accent2); }
+  .status-dot.error { background: var(--danger); }
+
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+</style>
+</head>
+<body>
+
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="spinner"></div>
+  <div class="loading-text">Cargando motor <span>FFmpeg</span>...<br><br>La primera vez puede tardar unos segundos.</div>
+</div>
+
+<div class="container">
+  <header>
+    <div class="logo-row">
+      <div class="logo-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#0a0a0a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 8s-4-2-10-2S2 8 2 8v8s4 2 10 2 10-2 10-2V8z"/>
+          <circle cx="12" cy="12" r="2"/>
+        </svg>
+      </div>
+      <h1>Video<span>Press</span></h1>
+    </div>
+    <div class="tagline">// compresor de video local · sin subir archivos a servidores</div>
+  </header>
+
+  <div class="ffmpeg-status">
+    <div class="status-dot loading" id="statusDot"></div>
+    <span id="statusText">Cargando motor FFmpeg...</span>
+  </div>
+
+  <!-- Drop Zone -->
+  <div class="drop-zone" id="dropZone">
+    <div class="drop-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+    </div>
+    <div class="drop-title">Arrastrá tu video acá</div>
+    <div class="drop-sub">MP4 · MOV · AVI · MKV · WEBM · FLV · TS · WMV · M4V · 3GP</div>
+    <button class="btn-browse" id="btnBrowse" type="button">Elegir archivo</button>
+    <input type="file" id="fileInput" accept="video/*,.mkv,.avi,.flv,.ts,.wmv,.m4v,.3gp,.mov">
+  </div>
+
+  <!-- File Card -->
+  <div class="file-card" id="fileCard">
+    <div class="file-thumb" id="fileThumb">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#444" stroke-width="1.5" width="24" height="24" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="23 7 16 12 23 17 23 7"/>
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+      </svg>
+    </div>
+    <div class="file-info">
+      <div class="file-name" id="fileName">—</div>
+      <div class="file-meta">
+        <span id="fileSize">—</span>
+        <span id="fileType">—</span>
+        <span id="fileDuration">—</span>
+      </div>
+    </div>
+    <button class="btn-clear" id="btnClear" title="Quitar archivo" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- Settings -->
+  <div class="settings" id="settingsPanel">
+    <div class="settings-header">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="16" height="16" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/>
+      </svg>
+      Configuración de compresión
+    </div>
+    <div class="settings-body">
+      <div class="setting-row">
+        <div class="setting-group">
+          <label>Codec de salida</label>
+          <select id="codecSelect">
+            <option value="libx264">H.264 (máxima compatibilidad)</option>
+            <option value="libx265">H.265/HEVC (mejor compresión)</option>
+            <option value="libvpx-vp9">VP9 (open source)</option>
+          </select>
+        </div>
+        <div class="setting-group">
+          <label>Resolución</label>
+          <select id="resolutionSelect">
+            <option value="original">Original (sin cambios)</option>
+            <option value="1920:-2">1080p (Full HD)</option>
+            <option value="1280:-2">720p (HD)</option>
+            <option value="854:-2">480p (SD)</option>
+            <option value="640:-2">360p</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="crf-header">
+          <label style="margin:0">Calidad visual (CRF)</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="crf-value" id="crfValue">23</span>
+            <span class="quality-label" id="qualityLabel">Balanceado</span>
+          </div>
+        </div>
+        <div class="crf-container" style="margin-top:10px">
+          <input type="range" id="crfSlider" min="0" max="51" value="23" step="1">
+          <div style="display:flex;justify-content:space-between">
+            <span class="crf-hint">← Sin pérdida (archivo grande)</span>
+            <span class="crf-hint">(archivo pequeño) máx compresión →</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group">
+          <label>Preset de velocidad</label>
+          <select id="presetSelect">
+            <option value="ultrafast">Ultra rápido (menor compresión)</option>
+            <option value="fast">Rápido</option>
+            <option value="medium" selected>Medio (recomendado)</option>
+            <option value="slow">Lento (mejor compresión)</option>
+            <option value="veryslow">Muy lento (máxima compresión)</option>
+          </select>
+        </div>
+        <div class="setting-group">
+          <label>Audio</label>
+          <select id="audioSelect">
+            <option value="copy">Copiar original (sin recodificar)</option>
+            <option value="aac_128">AAC 128k</option>
+            <option value="aac_192">AAC 192k</option>
+            <option value="mp3_128">MP3 128k</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="info-box">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="16" height="16" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span>CRF 18–23 = casi sin pérdida visual. CRF 23–28 = buena calidad con menor tamaño. La compresión ocurre 100% en tu navegador.</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Compress Button -->
+  <button class="btn-compress" id="btnCompress" disabled type="button">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="18" height="18" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+    </svg>
+    Comprimir Video
+  </button>
+
+  <!-- Progress -->
+  <div class="progress-panel" id="progressPanel">
+    <div class="progress-status">
+      <span class="progress-label" id="progressLabel">Procesando...</span>
+      <span class="progress-pct" id="progressPct">0%</span>
+    </div>
+    <div class="progress-bar-track">
+      <div class="progress-bar-fill" id="progressBar"></div>
+    </div>
+    <div class="progress-log" id="progressLog">Iniciando FFmpeg...</div>
+  </div>
+
+  <!-- Result -->
+  <div class="result-panel" id="resultPanel">
+    <div class="result-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" width="20" height="20" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+      ¡Compresión completada!
+    </div>
+    <div class="result-stats">
+      <div class="stat-card">
+        <div class="stat-label">Tamaño original</div>
+        <div class="stat-value" id="statOriginal">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Tamaño final</div>
+        <div class="stat-value highlight" id="statFinal">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Reducción</div>
+        <div class="stat-value highlight2" id="statReduction">—</div>
+      </div>
+    </div>
+    <a class="btn-download" id="btnDownload" href="#" download>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="18" height="18" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      Descargar video comprimido
+    </a>
+    <button class="btn-new" id="btnNew" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.9"/>
+      </svg>
+      Comprimir otro video
+    </button>
+  </div>
+
+  <footer>VideoPress · procesamiento local en tu navegador · powered by FFmpeg.wasm</footer>
+</div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────────
+let ffmpegLoaded = false;
+let ffmpegInstance = null;
+let selectedFile = null;
+let outputBlob = null;
+let ffmpegLib = null; // will hold { createFFmpeg, fetchFile }
+
+// ─── FFmpeg Loading ───────────────────────────────────────────────────────────
+function setStatus(state, text) {
+  const dot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  dot.className = 'status-dot ' + state;
+  statusText.textContent = text;
+}
+
+async function initFFmpeg() {
+  setStatus('loading', 'Cargando motor FFmpeg...');
+  document.getElementById('loadingOverlay').classList.add('visible');
+
+  try {
+    // The CDN exposes window.FFmpeg as the namespace
+    const lib = window.FFmpeg || window.FFmpegWASM;
+    if (!lib) throw new Error('Librería FFmpeg no encontrada en window');
+
+    const { createFFmpeg, fetchFile } = lib;
+    ffmpegLib = { createFFmpeg, fetchFile };
+
+    ffmpegInstance = createFFmpeg({
+      log: true,
+      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
+      progress: ({ ratio }) => {
+        const pct = Math.min(99, Math.round(ratio * 100));
+        document.getElementById('progressBar').style.width = pct + '%';
+        document.getElementById('progressPct').textContent = pct + '%';
+        if (pct >= 99) document.getElementById('progressLabel').textContent = 'Finalizando...';
+      }
+    });
+
+    await ffmpegInstance.load();
+    ffmpegLoaded = true;
+    setStatus('ready', 'Motor listo · FFmpeg 0.11.6');
+
+    // Enable compress button if file already selected
+    if (selectedFile) {
+      document.getElementById('btnCompress').disabled = false;
+    }
+  } catch (err) {
+    console.error('FFmpeg init error:', err);
+    setStatus('error', 'Error al cargar FFmpeg: ' + err.message);
+    document.getElementById('progressPanel').classList.add('visible');
+    document.getElementById('progressLabel').textContent = '❌ Error al cargar FFmpeg';
+    document.getElementById('progressLog').textContent = 'Intentá recargar la página o usar otro navegador (Chrome recomendado).';
+  } finally {
+    document.getElementById('loadingOverlay').classList.remove('visible');
+  }
+}
+
+// Try primary CDN, fallback to unpkg
+function loadFFmpegScript() {
+  const primary = 'https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js';
+  const fallback = 'https://cdnjs.cloudflare.com/ajax/libs/ffmpeg/0.11.6/ffmpeg.min.js';
+
+  const s = document.createElement('script');
+  s.src = primary;
+  s.crossOrigin = 'anonymous';
+  s.onload = () => {
+    console.log('FFmpeg script loaded from primary CDN');
+    initFFmpeg();
+  };
+  s.onerror = () => {
+    console.warn('Primary CDN failed, trying fallback...');
+    const s2 = document.createElement('script');
+    s2.src = fallback;
+    s2.crossOrigin = 'anonymous';
+    s2.onload = () => {
+      console.log('FFmpeg script loaded from fallback CDN');
+      initFFmpeg();
+    };
+    s2.onerror = () => {
+      setStatus('error', 'No se pudo cargar FFmpeg. Verificá tu conexión.');
+      document.getElementById('loadingOverlay').classList.remove('visible');
+    };
+    document.head.appendChild(s2);
+  };
+  document.head.appendChild(s);
+}
+
+// Start loading immediately
+loadFFmpegScript();
+
+// ─── CRF Slider ──────────────────────────────────────────────────────────────
+const crfSlider = document.getElementById('crfSlider');
+const crfValueEl = document.getElementById('crfValue');
+const qualityLabel = document.getElementById('qualityLabel');
+
+const qualityMap = [
+  [0,  15, 'Sin pérdida',    '#e8ff47'],
+  [16, 22, 'Alta calidad',   '#a8ff47'],
+  [23, 27, 'Balanceado',     '#e8ff47'],
+  [28, 35, 'Comprimido',     '#ffa847'],
+  [36, 51, 'Máx compresión', '#ff6347'],
+];
+
+crfSlider.addEventListener('input', () => {
+  const v = parseInt(crfSlider.value);
+  crfValueEl.textContent = v;
+  for (const [min, max, label, color] of qualityMap) {
+    if (v >= min && v <= max) {
+      qualityLabel.textContent = label;
+      qualityLabel.style.color = color;
+      qualityLabel.style.borderColor = color + '44';
+      qualityLabel.style.background = color + '15';
+      crfValueEl.style.color = color;
+      break;
+    }
+  }
+});
+
+// ─── File Input ───────────────────────────────────────────────────────────────
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const btnBrowse = document.getElementById('btnBrowse');
+
+// Browse button — trigger file input programmatically
+btnBrowse.addEventListener('click', (e) => {
+  e.stopPropagation();
+  fileInput.click();
+});
+
+// Drop zone click also opens file picker (but not on the button itself)
+dropZone.addEventListener('click', (e) => {
+  if (e.target === btnBrowse || e.target.closest('#btnBrowse')) return;
+  fileInput.click();
+});
+
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  dropZone.classList.add('dragover');
+});
+
+dropZone.addEventListener('dragleave', (e) => {
+  e.stopPropagation();
+  dropZone.classList.remove('dragover');
+});
+
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  dropZone.classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (file) handleFile(file);
+});
+
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files && e.target.files[0]) {
+    handleFile(e.target.files[0]);
+    // Reset so same file can be re-selected
+    e.target.value = '';
+  }
+});
+
+document.getElementById('btnClear').addEventListener('click', clearFile);
+
+function handleFile(file) {
+  // Accept any video/* or common video extensions
+  const ext = file.name.split('.').pop().toLowerCase();
+  const videoExts = ['mp4','mov','avi','mkv','webm','flv','ts','wmv','m4v','3gp','mts','m2ts','ogv','vob','rm','rmvb'];
+  const isVideo = file.type.startsWith('video/') || videoExts.includes(ext);
+
+  if (!isVideo) {
+    alert('Por favor seleccioná un archivo de video válido.');
+    return;
+  }
+
+  selectedFile = file;
+
+  document.getElementById('fileName').textContent = file.name;
+  document.getElementById('fileSize').textContent = '📦 ' + formatBytes(file.size);
+
+  const typeLabel = file.type || ('.' + ext.toUpperCase());
+  document.getElementById('fileType').textContent = '🎬 ' + typeLabel;
+
+  // Generate thumbnail
+  const thumb = document.getElementById('fileThumb');
+  const url = URL.createObjectURL(file);
+  const vid = document.createElement('video');
+  vid.src = url;
+  vid.muted = true;
+  vid.playsInline = true;
+  vid.preload = 'metadata';
+
+  vid.onloadedmetadata = () => {
+    const dur = vid.duration;
+    document.getElementById('fileDuration').textContent = '⏱ ' + formatDuration(dur);
+    vid.currentTime = Math.min(2, dur * 0.1);
+  };
+
+  vid.onseeked = () => {
+    thumb.innerHTML = '';
+    vid.style.width = '100%';
+    vid.style.height = '100%';
+    vid.style.objectFit = 'cover';
+    thumb.appendChild(vid);
+  };
+
+  vid.onerror = () => {
+    // Can't preview this format — show icon instead
+    thumb.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="1.5" width="24" height="24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
+    document.getElementById('fileDuration').textContent = '';
+  };
+
+  document.getElementById('fileCard').classList.add('visible');
+  document.getElementById('settingsPanel').classList.add('visible');
+  document.getElementById('resultPanel').classList.remove('visible');
+  document.getElementById('progressPanel').classList.remove('visible');
+
+  // Only enable compress if FFmpeg is ready
+  document.getElementById('btnCompress').disabled = !ffmpegLoaded;
+
+  if (!ffmpegLoaded) {
+    document.getElementById('progressPanel').classList.add('visible');
+    document.getElementById('progressLabel').textContent = 'Esperando motor FFmpeg...';
+    document.getElementById('progressLog').textContent = 'El motor se está cargando, aguardá un momento.';
+  }
+}
+
+function clearFile() {
+  selectedFile = null;
+  fileInput.value = '';
+  document.getElementById('fileCard').classList.remove('visible');
+  document.getElementById('settingsPanel').classList.remove('visible');
+  document.getElementById('btnCompress').disabled = true;
+  document.getElementById('resultPanel').classList.remove('visible');
+  document.getElementById('progressPanel').classList.remove('visible');
+}
+
+// ─── Compression ──────────────────────────────────────────────────────────────
+document.getElementById('btnCompress').addEventListener('click', async () => {
+  if (!selectedFile || !ffmpegLoaded || !ffmpegInstance) return;
+
+  const codec      = document.getElementById('codecSelect').value;
+  const resolution = document.getElementById('resolutionSelect').value;
+  const crf        = document.getElementById('crfSlider').value;
+  const preset     = document.getElementById('presetSelect').value;
+  const audio      = document.getElementById('audioSelect').value;
+
+  let ext = 'mp4';
+  if (codec === 'libvpx-vp9') ext = 'webm';
+
+  const fileExt   = selectedFile.name.split('.').pop() || 'mp4';
+  const inputName = 'input_' + Date.now() + '.' + fileExt;
+  const outputName = 'output_' + Date.now() + '.' + ext;
+
+  // UI state
+  document.getElementById('progressPanel').classList.add('visible');
+  document.getElementById('resultPanel').classList.remove('visible');
+  document.getElementById('btnCompress').disabled = true;
+  document.getElementById('progressLabel').textContent = 'Cargando archivo en memoria...';
+  document.getElementById('progressLog').textContent = 'Preparando compresión...';
+  document.getElementById('progressBar').style.width = '0%';
+  document.getElementById('progressPct').textContent = '0%';
+
+  try {
+    const { fetchFile } = ffmpegLib;
+
+    document.getElementById('progressLog').textContent = 'Leyendo archivo...';
+    const fileData = await fetchFile(selectedFile);
+    ffmpegInstance.FS('writeFile', inputName, fileData);
+
+    // Build FFmpeg command
+    const args = ['-i', inputName];
+
+    // Video codec
+    args.push('-c:v', codec);
+
+    if (codec === 'libx264' || codec === 'libx265') {
+      args.push('-crf', crf.toString());
+      args.push('-preset', preset);
+      if (codec === 'libx265') args.push('-tag:v', 'hvc1');
+    } else if (codec === 'libvpx-vp9') {
+      args.push('-crf', crf.toString(), '-b:v', '0');
+      const deadline = { ultrafast: 'realtime', fast: 'good', medium: 'good', slow: 'best', veryslow: 'best' }[preset] || 'good';
+      args.push('-deadline', deadline);
+    }
+
+    // Resolution filter
+    if (resolution !== 'original') {
+      args.push('-vf', `scale=${resolution}`);
+    }
+
+    // Audio
+    if (audio === 'copy') {
+      args.push('-c:a', 'copy');
+    } else if (audio === 'mp3_128') {
+      args.push('-c:a', 'libmp3lame', '-b:a', '128k');
+    } else {
+      const bitrate = audio.split('_')[1] + 'k';
+      args.push('-c:a', 'aac', '-b:a', bitrate);
+    }
+
+    if (ext === 'mp4') args.push('-movflags', '+faststart');
+    args.push('-y', outputName);
+
+    document.getElementById('progressLabel').textContent = 'Comprimiendo video...';
+    document.getElementById('progressLog').textContent = 'ffmpeg ' + args.join(' ');
+
+    await ffmpegInstance.run(...args);
+
+    const data = ffmpegInstance.FS('readFile', outputName);
+    const mime = ext === 'webm' ? 'video/webm' : 'video/mp4';
+    outputBlob = new Blob([data.buffer], { type: mime });
+
+    const origSize  = selectedFile.size;
+    const newSize   = outputBlob.size;
+    const reduction = ((1 - newSize / origSize) * 100).toFixed(1);
+
+    document.getElementById('statOriginal').textContent  = formatBytes(origSize);
+    document.getElementById('statFinal').textContent     = formatBytes(newSize);
+    document.getElementById('statReduction').textContent = (reduction > 0 ? '-' : '+') + Math.abs(reduction) + '%';
+
+    const url     = URL.createObjectURL(outputBlob);
+    const outName = selectedFile.name.replace(/\.[^.]+$/, '') + '_comprimido.' + ext;
+    const dl = document.getElementById('btnDownload');
+    dl.href     = url;
+    dl.download = outName;
+
+    document.getElementById('progressBar').style.width = '100%';
+    document.getElementById('progressPct').textContent  = '100%';
+
+    setTimeout(() => {
+      document.getElementById('progressPanel').classList.remove('visible');
+      document.getElementById('resultPanel').classList.add('visible');
+    }, 400);
+
+    // Cleanup FS
+    try { ffmpegInstance.FS('unlink', inputName); } catch(e) {}
+    try { ffmpegInstance.FS('unlink', outputName); } catch(e) {}
+
+  } catch (err) {
+    console.error('Compression error:', err);
+    document.getElementById('progressLabel').textContent = '❌ Error durante la compresión';
+    document.getElementById('progressLog').textContent   =
+      (err.message || 'Error desconocido') +
+      '\n\nSugerencias: probá con H.264 + preset Rápido, o reducí la resolución.';
+  } finally {
+    document.getElementById('btnCompress').disabled = false;
+  }
+});
+
+// ─── Reset ────────────────────────────────────────────────────────────────────
+document.getElementById('btnNew').addEventListener('click', () => {
+  clearFile();
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function formatBytes(b) {
+  if (!b) return '—';
+  if (b < 1024)            return b + ' B';
+  if (b < 1024 * 1024)     return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(2) + ' MB';
+  return (b / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function formatDuration(s) {
+  if (!s || !isFinite(s)) return '—';
+  const h   = Math.floor(s / 3600);
+  const m   = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
+  return m + ':' + String(sec).padStart(2,'0');
+}
+</script>
+</body>
+</html>
